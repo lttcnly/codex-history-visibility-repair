@@ -69,6 +69,11 @@ On Windows, use `py` if `python` points to the Microsoft Store/WindowsApps
 placeholder. Only pass `--scan-project-parent D:\object` when you intentionally
 want every child directory under that parent to become a saved Codex project.
 
+If Codex Desktop is running during the repair, the script defers the pruned
+`.codex-global-state.json` write until after Codex exits. This is important
+because the running desktop app can otherwise flush stale empty projects from
+memory back to disk.
+
 ## What It Repairs
 
 | Store | Repair |
@@ -77,7 +82,7 @@ want every child directory under that parent to become a saved Codex project.
 | Rollout JSONL files | Updates the first `session_meta.payload` so app-server scans do not restore stale metadata. |
 | `session_index.jsonl` | Rebuilds the visible session index from repaired thread rows. |
 | `history.jsonl` | Rebuilds prompt history rows used by Desktop history surfaces. |
-| `.codex-global-state.json` | Rewrites workspace roots, thread root hints, and project assignments. Stale saved roots are pruned by default. |
+| `.codex-global-state.json` | Rewrites workspace roots, thread root hints, and project assignments. Stale saved roots with no visible conversations are pruned by default and re-applied after Codex exits when needed. |
 
 Backups are created in:
 
@@ -116,6 +121,13 @@ Backups are created in:
     Temporarily mark .codex-global-state.json read-only after repair.
     Defaults to 0 minutes.
 
+--after-exit-global-state auto|always|never
+    Reapply pruned global state after Codex exits so running Desktop cannot
+    overwrite it. Defaults to auto.
+
+--after-exit-timeout-minutes N
+    Maximum time for the after-exit writer to wait. Defaults to 720.
+
 --verify-app-server
     Start Codex app-server and call thread/list in both state-db-only and
     scan modes to verify visibility.
@@ -143,6 +155,10 @@ The script prints JSON. Useful fields:
 | `rolloutMetaSkippedLocked` | Rollout files skipped because they could not be read. |
 | `rolloutMissing` | Thread rows whose rollout path is missing. |
 | `projectRoots` | Workspace roots written into global state. |
+| `projectRootsPruned` | Saved project roots removed because they had no visible conversations. |
+| `globalStateWrittenNow` | Whether `.codex-global-state.json` was written during this run. False when persistence is deferred until Codex exits. |
+| `afterExitGlobalStateRequested` | Whether the current run determined that post-exit persistence is needed. |
+| `afterExitGlobalStateScheduled` | Whether a post-exit global-state writer was started. |
 | `projectMappings` | Thread-to-project assignments written into global state. |
 | `providerDistribution` | Distribution of visible thread `model_provider` values. |
 | `sourceDistribution` | Distribution of visible thread `source` values. |
@@ -175,6 +191,9 @@ If the sidebar still does not show the expected history:
 6. If sessions are archived, use `--target all --unarchive`.
 7. If scan-mode verification times out on very large rollout files, increase
    `--verify-timeout-seconds`.
+8. If empty projects return after reopening, run the repair and confirm
+   `afterExitGlobalStateScheduled` is true, then fully exit Codex Desktop before
+   reopening.
 
 ## Repository Layout
 

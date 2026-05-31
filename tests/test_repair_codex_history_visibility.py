@@ -123,6 +123,51 @@ class RepairCodexHistoryVisibilityTest(unittest.TestCase):
 
         self.assertGreaterEqual(args.verify_timeout_seconds, 90)
 
+    def test_repair_global_state_reports_pruned_empty_project_roots(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            (home / ".codex-global-state.json").write_text(
+                """
+                {
+                  "electron-saved-workspace-roots": [
+                    "D:\\\\object\\\\empty",
+                    "D:\\\\object\\\\plan-a"
+                  ],
+                  "project-order": [
+                    "D:\\\\object\\\\empty",
+                    "D:\\\\object\\\\plan-a"
+                  ],
+                  "thread-workspace-root-hints": {},
+                  "thread-project-assignments": {}
+                }
+                """,
+                encoding="utf-8",
+            )
+            threads = [{"id": "thread-1", "cwd": r"D:\object\plan-a\backend"}]
+
+            result = repair.repair_global_state(home, threads, [], False, True)
+
+            self.assertEqual(result["roots"], 1)
+            self.assertEqual(result["prunedRoots"], [r"D:\object\empty"])
+            self.assertEqual(result["assignments"], 1)
+
+    def test_after_exit_state_reapply_writes_payload_and_script(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            backup_dir = Path(tmp)
+            home = backup_dir / "home"
+            home.mkdir()
+            state_path = home / ".codex-global-state.json"
+            state_path.write_text('{"electron-saved-workspace-roots":[]}', encoding="utf-8")
+            state = {"electron-saved-workspace-roots": [r"D:\object\plan-a"]}
+
+            script = repair.schedule_global_state_reapply_after_exit(home, state, backup_dir, 30, dry_run=False)
+
+            self.assertIsNotNone(script)
+            assert script is not None
+            self.assertTrue(script.exists())
+            self.assertTrue((backup_dir / "pending-global-state.json").exists())
+            self.assertIn("Codex", script.read_text(encoding="utf-8"))
+
 
 if __name__ == "__main__":
     unittest.main()

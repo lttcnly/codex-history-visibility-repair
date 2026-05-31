@@ -23,6 +23,10 @@ Apply the repair and verify via `app-server thread/list`:
 py "$env:USERPROFILE\.codex\skills\codex-history-visibility-repair\scripts\repair_codex_history_visibility.py" --verify-app-server
 ```
 
+When Codex Desktop is still running, the script schedules the repaired global
+state to be written after Codex exits. This prevents the running app from
+restoring stale empty projects from memory.
+
 If restored sessions are still archived, include them explicitly:
 
 ```powershell
@@ -36,10 +40,11 @@ directory under that parent to become a saved Codex project.
 ## Workflow
 
 1. Confirm the symptom with local counts: session files exist but `thread/list` or the sidebar returns too few rows.
-2. Run `--dry-run`; check `selectedThreads`, `visibleThreads`, `resolvedProvider`, `resolvedSource`, `providerDistribution`, and `projectMappings`.
+2. Run `--dry-run`; check `selectedThreads`, `visibleThreads`, `resolvedProvider`, `resolvedSource`, `projectRoots`, `projectRootsPruned`, `providerDistribution`, and `projectMappings`.
 3. Run without `--dry-run`; the script creates `~/.codex/history_sync_backups/visibility-repair.*`.
 4. Prefer `--verify-app-server`; success means both `threadListStateDbOnly.returned` and `threadListScanMode.returned` match visible thread count.
-5. Fully exit Codex Desktop, wait 5-10 seconds, reopen it.
+5. If `globalStateWrittenNow` is false and `afterExitGlobalStateScheduled` is true, fully exit Codex Desktop so the scheduled writer can persist the pruned project list.
+6. Fully exit Codex Desktop, wait 5-10 seconds, reopen it.
 
 If scan-mode verification has to read very large rollout files, increase
 `--verify-timeout-seconds`.
@@ -52,7 +57,7 @@ If scan-mode verification has to read very large rollout files, increase
 | rollout JSONL | syncs first `session_meta.payload` so scans do not restore stale metadata |
 | `session_index.jsonl` | rebuilds visible thread index |
 | `history.jsonl` | rebuilds prompt history entries used by desktop history surfaces |
-| `.codex-global-state.json` | rewrites project roots, root hints, and complete project assignments; stale saved roots are pruned by default |
+| `.codex-global-state.json` | rewrites project roots, root hints, and complete project assignments; stale saved roots with no visible conversations are pruned by default and re-applied after Codex exits when needed |
 
 Provider and source default to `auto`, derived from the latest visible local thread,
 because Codex Desktop builds can filter by exact `model_provider` and `source`.
@@ -67,7 +72,8 @@ saved roots that are not referenced by visible threads.
 - Do not patch only `state_5.sqlite`; app-server scans rollout JSONL and can reintroduce stale provider/source metadata.
 - Do not leave old after-exit scripts running; they can overwrite the repaired global state.
 - Do not use `--scan-project-parent` as a default; it can re-add projects the user removed from the sidebar.
-- Do not use `--protect-state-minutes` unless you explicitly need a temporary write block; leaving global state read-only prevents Codex Desktop from saving sidebar changes.
+- Do not use `--protect-state-minutes` for persistence; the safer default is `--after-exit-global-state auto`, which rewrites once after Codex exits without leaving the state file read-only.
+- Do not assume an immediate `.codex-global-state.json` edit will persist while Codex Desktop is running; check `afterExitGlobalStateScheduled`.
 - Do not publish personal backups, databases, logs, or auth files with this skill.
 
 ## Publishing Hygiene

@@ -330,18 +330,15 @@ def build_project_roots(
     return roots
 
 
-def repair_global_state(
-    home: Path,
+def build_repaired_global_state(
+    state: dict[str, Any],
     threads: list[sqlite3.Row],
     scan_parents: list[Path],
     keep_existing_roots: bool,
-    dry_run: bool,
-) -> tuple[int, int]:
-    state_path = home / ".codex-global-state.json"
-    if not state_path.exists():
-        return 0, 0
-    state = read_json(state_path)
+) -> dict[str, Any]:
+    original_roots = [normalize_path(str(value)) for value in state.get("electron-saved-workspace-roots", []) or []]
     roots = build_project_roots(state, threads, scan_parents, keep_existing_roots=keep_existing_roots)
+    pruned_roots = [root for root in original_roots if root and root not in roots]
 
     hints: dict[str, str] = {}
     assignments: dict[str, dict[str, Any]] = {}
@@ -357,19 +354,134 @@ def repair_global_state(
             "pendingCoreUpdate": False,
         }
 
-    state["electron-saved-workspace-roots"] = roots
-    state["project-order"] = roots
-    state["active-workspace-roots"] = []
-    state["projectless-thread-ids"] = []
-    state["thread-workspace-root-hints"] = hints
-    state["thread-project-assignments"] = assignments
+    repaired = json.loads(json.dumps(state, ensure_ascii=False))
+    repaired["electron-saved-workspace-roots"] = roots
+    repaired["project-order"] = roots
+    repaired["active-workspace-roots"] = []
+    repaired["projectless-thread-ids"] = []
+    repaired["thread-workspace-root-hints"] = hints
+    repaired["thread-project-assignments"] = assignments
+
+    return {
+        "state": repaired,
+        "roots": len(roots),
+        "assignments": len(assignments),
+        "prunedRoots": pruned_roots,
+    }
+
+
+def repair_global_state(
+    home: Path,
+    threads: list[sqlite3.Row],
+    scan_parents: list[Path],
+    keep_existing_roots: bool,
+    dry_run: bool,
+) -> dict[str, Any]:
+    state_path = home / ".codex-global-state.json"
+    if not state_path.exists():
+        return {"state": {}, "roots": 0, "assignments": 0, "prunedRoots": []}
+    plan = build_repaired_global_state(read_json(state_path), threads, scan_parents, keep_existing_roots)
 
     if not dry_run:
         ensure_writable(state_path)
         ensure_writable(home / ".codex-global-state.json.bak")
-        write_json(state_path, state)
-        write_json(home / ".codex-global-state.json.bak", state)
-    return len(roots), len(assignments)
+        write_json(state_path, plan["state"])
+        write_json(home / ".codex-global-state.json.bak", plan["state"])
+    return plan
+
+
+def codex_processes_running() -> bool:
+    if os.name != "nt":
+        return False
+    try:
+        proc = subprocess.run(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-Command",
+                "@(Get-Process -Name Codex,codex -ErrorAction SilentlyContinue).Count",
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=5,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    try:
+        return int(proc.stdout.strip() or "0") > 0
+    except ValueError:
+        return False
+
+
+def ps_quote(value: Path) -> str:
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def schedule_global_state_reapply_after_exit(
+    home: Path,
+    state: dict[str, Any],
+    backup_dir: Path,
+    timeout_minutes: int,
+    dry_run: bool,
+    launch: bool = False,
+) -> Path | None:
+    if dry_run or timeout_minutes <= 0:
+        return None
+
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    payload_path = backup_dir / "pending-global-state.json"
+    script_path = backup_dir / "reapply-global-state-after-codex-exit.ps1"
+    write_json(payload_path, state)
+
+    state_path = home / ".codex-global-state.json"
+    bak_path = home / ".codex-global-state.json.bak"
+    script_path.write_text(
+        "\n".join(
+            [
+                "$ErrorActionPreference = 'Stop'",
+                f"$state = {ps_quote(state_path)}",
+                f"$bak = {ps_quote(bak_path)}",
+                f"$payload = {ps_quote(payload_path)}",
+                f"$deadline = (Get-Date).AddMinutes({timeout_minutes})",
+                "while ((Get-Date) -lt $deadline) {",
+                "  $running = @(Get-Process -Name Codex,codex -ErrorAction SilentlyContinue)",
+                "  if ($running.Count -eq 0) {",
+                "    Start-Sleep -Seconds 5",
+                "    $running = @(Get-Process -Name Codex,codex -ErrorAction SilentlyContinue)",
+                "    if ($running.Count -eq 0) {",
+                "      if (Test-Path -LiteralPath $state) { (Get-Item -LiteralPath $state).IsReadOnly = $false }",
+                "      Copy-Item -LiteralPath $payload -Destination $state -Force",
+                "      Copy-Item -LiteralPath $payload -Destination $bak -Force",
+                "      Remove-Item -LiteralPath $MyInvocation.MyCommand.Path -Force -ErrorAction SilentlyContinue",
+                "      exit 0",
+                "    }",
+                "  }",
+                "  Start-Sleep -Seconds 5",
+                "}",
+                "exit 2",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    if launch:
+        subprocess.Popen(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-WindowStyle",
+                "Hidden",
+                "-File",
+                str(script_path),
+            ],
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    return script_path
 
 
 def protect_global_state(home: Path, minutes: int, backup_dir: Path, dry_run: bool) -> bool:
@@ -516,6 +628,13 @@ def parse_args() -> argparse.Namespace:
         help="Keep saved project roots that are not referenced by visible threads.",
     )
     parser.add_argument("--protect-state-minutes", type=int, default=0)
+    parser.add_argument(
+        "--after-exit-global-state",
+        choices=["auto", "always", "never"],
+        default="auto",
+        help="Reapply pruned global state after Codex exits so running Desktop cannot overwrite it.",
+    )
+    parser.add_argument("--after-exit-timeout-minutes", type=int, default=720)
     parser.add_argument("--verify-app-server", action="store_true")
     parser.add_argument("--verify-timeout-seconds", type=int, default=90)
     parser.add_argument("--dry-run", action="store_true")
@@ -557,13 +676,29 @@ def main() -> int:
             dry_run=args.dry_run,
         )
         rows = rebuild_history_files(home, visible, args.dry_run)
-        roots, mappings = repair_global_state(
+        codex_running = codex_processes_running()
+        should_schedule_global_state = args.after_exit_global_state == "always" or (
+            args.after_exit_global_state == "auto" and codex_running
+        )
+        write_global_state_now = not should_schedule_global_state
+        global_state_repair = repair_global_state(
             home,
             visible,
             args.scan_project_parent,
             args.keep_existing_project_roots,
-            args.dry_run,
+            args.dry_run or not write_global_state_now,
         )
+        desired_global_state = global_state_repair["state"]
+        after_exit_script = None
+        if should_schedule_global_state:
+            after_exit_script = schedule_global_state_reapply_after_exit(
+                home,
+                desired_global_state,
+                backup_dir,
+                args.after_exit_timeout_minutes,
+                args.dry_run,
+                launch=not args.dry_run,
+            )
         protected = protect_global_state(home, args.protect_state_minutes, backup_dir, args.dry_run)
 
         result: dict[str, Any] = {
@@ -579,8 +714,15 @@ def main() -> int:
             "rolloutMetaChanged": changed,
             "rolloutMetaSkippedLocked": skipped_locked,
             "rolloutMissing": missing,
-            "projectRoots": roots,
-            "projectMappings": mappings,
+            "projectRoots": global_state_repair["roots"],
+            "projectMappings": global_state_repair["assignments"],
+            "projectRootsPruned": len(global_state_repair["prunedRoots"]),
+            "projectRootsPrunedValues": global_state_repair["prunedRoots"],
+            "codexProcessesRunning": codex_running,
+            "globalStateWrittenNow": (not args.dry_run) and write_global_state_now,
+            "afterExitGlobalStateRequested": should_schedule_global_state,
+            "afterExitGlobalStateScheduled": after_exit_script is not None,
+            "afterExitGlobalStateScript": None if after_exit_script is None else str(after_exit_script),
             "providerDistribution": distribution(con, "model_provider"),
             "sourceDistribution": distribution(con, "source"),
             "stateProtected": protected,
