@@ -101,13 +101,38 @@ def fetch_threads(con: sqlite3.Connection, target: str) -> list[sqlite3.Row]:
         con.execute(
             f"""
             SELECT id, rollout_path, cwd, title, updated_at, updated_at_ms,
-                   created_at, created_at_ms, archived
+                   created_at, created_at_ms, archived, archived_at
             FROM threads
             {where}
             ORDER BY COALESCE(updated_at_ms, updated_at * 1000) DESC, updated_at DESC
             """
         )
     )
+
+
+def resolve_provider_and_source(
+    con: sqlite3.Connection,
+    provider: str,
+    source: str,
+) -> tuple[str, str]:
+    if provider != "auto" and source != "auto":
+        return provider, source
+
+    latest = con.execute(
+        """
+        SELECT model_provider, source
+          FROM threads
+         WHERE archived = 0
+         ORDER BY COALESCE(updated_at_ms, updated_at * 1000) DESC, updated_at DESC
+         LIMIT 1
+        """
+    ).fetchone()
+
+    if provider == "auto":
+        provider = (latest["model_provider"] if latest else None) or "OpenAI"
+    if source == "auto":
+        source = (latest["source"] if latest else None) or "vscode"
+    return provider, source
 
 
 def repair_database(
@@ -125,7 +150,7 @@ def repair_database(
         created_at_ms = row["created_at_ms"] or (int(row["created_at"]) * 1000)
         updated_at_ms = row["updated_at_ms"] or (int(row["updated_at"]) * 1000)
         archived = 0 if unarchive else row["archived"]
-        archived_at = None if unarchive else None
+        archived_at = None if unarchive else row["archived_at"]
         con.execute(
             """
             UPDATE threads
@@ -280,6 +305,7 @@ def build_project_roots(
     state: dict[str, Any],
     threads: list[sqlite3.Row],
     scan_parents: list[Path],
+    keep_existing_roots: bool = False,
 ) -> list[str]:
     roots: list[str] = []
 
@@ -287,8 +313,9 @@ def build_project_roots(
         if value and value not in roots:
             roots.append(value)
 
-    for value in state.get("electron-saved-workspace-roots", []) or []:
-        add(normalize_path(str(value)))
+    if keep_existing_roots:
+        for value in state.get("electron-saved-workspace-roots", []) or []:
+            add(normalize_path(str(value)))
 
     documents = Path(os.environ.get("USERPROFILE", str(Path.home()))) / "Documents"
     for row in threads:
@@ -307,13 +334,14 @@ def repair_global_state(
     home: Path,
     threads: list[sqlite3.Row],
     scan_parents: list[Path],
+    keep_existing_roots: bool,
     dry_run: bool,
 ) -> tuple[int, int]:
     state_path = home / ".codex-global-state.json"
     if not state_path.exists():
         return 0, 0
     state = read_json(state_path)
-    roots = build_project_roots(state, threads, scan_parents)
+    roots = build_project_roots(state, threads, scan_parents, keep_existing_roots=keep_existing_roots)
 
     hints: dict[str, str] = {}
     assignments: dict[str, dict[str, Any]] = {}
@@ -389,7 +417,7 @@ def find_codex_exe() -> str | None:
     return None
 
 
-def verify_app_server(workdir: Path, use_state_db_only: bool) -> dict[str, Any]:
+def verify_app_server(workdir: Path, use_state_db_only: bool, timeout_seconds: int) -> dict[str, Any]:
     codex = find_codex_exe()
     if not codex:
         return {"ok": False, "error": "codex executable not found"}
@@ -441,7 +469,7 @@ def verify_app_server(workdir: Path, use_state_db_only: bool) -> dict[str, Any]:
         proc.stdin.write(json.dumps(req, separators=(",", ":")) + "\n")
         proc.stdin.flush()
 
-        deadline = time.time() + 30
+        deadline = time.time() + timeout_seconds
         while time.time() < deadline:
             try:
                 line = out_queue.get(timeout=1)
@@ -478,12 +506,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--codex-home", type=Path, default=default_codex_home())
     parser.add_argument("--target", choices=["visible", "all"], default="visible")
     parser.add_argument("--unarchive", action="store_true", help="Set selected threads archived=0.")
-    parser.add_argument("--provider", default="OpenAI", help="Exact model_provider value accepted by current desktop app.")
-    parser.add_argument("--source", default="cli")
+    parser.add_argument("--provider", default="auto", help="Exact model_provider value accepted by current desktop app, or auto.")
+    parser.add_argument("--source", default="auto", help="Exact source value accepted by current desktop app, or auto.")
     parser.add_argument("--thread-source", default="user")
     parser.add_argument("--scan-project-parent", type=Path, action="append", default=[])
-    parser.add_argument("--protect-state-minutes", type=int, default=15)
+    parser.add_argument(
+        "--keep-existing-project-roots",
+        action="store_true",
+        help="Keep saved project roots that are not referenced by visible threads.",
+    )
+    parser.add_argument("--protect-state-minutes", type=int, default=0)
     parser.add_argument("--verify-app-server", action="store_true")
+    parser.add_argument("--verify-timeout-seconds", type=int, default=90)
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()
 
@@ -502,12 +536,13 @@ def main() -> int:
     con = sqlite3.connect(db_path)
     con.row_factory = sqlite3.Row
     try:
+        provider, source = resolve_provider_and_source(con, args.provider, args.source)
         selected = fetch_threads(con, args.target)
         repair_database(
             con,
             selected,
-            provider=args.provider,
-            source=args.source,
+            provider=provider,
+            source=source,
             thread_source=args.thread_source,
             unarchive=args.unarchive,
             dry_run=args.dry_run,
@@ -515,20 +550,28 @@ def main() -> int:
         visible = fetch_threads(con, "visible")
         changed, skipped_locked, missing = patch_rollout_files(
             visible,
-            provider=args.provider,
-            source=args.source,
+            provider=provider,
+            source=source,
             thread_source=args.thread_source,
             backup_dir=backup_dir,
             dry_run=args.dry_run,
         )
         rows = rebuild_history_files(home, visible, args.dry_run)
-        roots, mappings = repair_global_state(home, visible, args.scan_project_parent, args.dry_run)
+        roots, mappings = repair_global_state(
+            home,
+            visible,
+            args.scan_project_parent,
+            args.keep_existing_project_roots,
+            args.dry_run,
+        )
         protected = protect_global_state(home, args.protect_state_minutes, backup_dir, args.dry_run)
 
         result: dict[str, Any] = {
             "ok": True,
             "dryRun": bool(args.dry_run),
             "backupDir": None if args.dry_run else str(backup_dir),
+            "resolvedProvider": provider,
+            "resolvedSource": source,
             "selectedThreads": len(selected),
             "visibleThreads": len(visible),
             "sessionIndexRows": rows,
@@ -547,8 +590,8 @@ def main() -> int:
 
     if args.verify_app_server:
         workdir = Path.cwd()
-        result["threadListStateDbOnly"] = verify_app_server(workdir, True)
-        result["threadListScanMode"] = verify_app_server(workdir, False)
+        result["threadListStateDbOnly"] = verify_app_server(workdir, True, args.verify_timeout_seconds)
+        result["threadListScanMode"] = verify_app_server(workdir, False, args.verify_timeout_seconds)
 
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0

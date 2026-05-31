@@ -14,28 +14,35 @@ Use the bundled Python script to repair Codex Desktop's local history indexes af
 Run a dry run first:
 
 ```powershell
-python "$env:USERPROFILE\.codex\skills\codex-history-visibility-repair\scripts\repair_codex_history_visibility.py" --dry-run --scan-project-parent D:\object
+py "$env:USERPROFILE\.codex\skills\codex-history-visibility-repair\scripts\repair_codex_history_visibility.py" --dry-run --verify-app-server
 ```
 
 Apply the repair and verify via `app-server thread/list`:
 
 ```powershell
-python "$env:USERPROFILE\.codex\skills\codex-history-visibility-repair\scripts\repair_codex_history_visibility.py" --scan-project-parent D:\object --verify-app-server
+py "$env:USERPROFILE\.codex\skills\codex-history-visibility-repair\scripts\repair_codex_history_visibility.py" --verify-app-server
 ```
 
 If restored sessions are still archived, include them explicitly:
 
 ```powershell
-python "$env:USERPROFILE\.codex\skills\codex-history-visibility-repair\scripts\repair_codex_history_visibility.py" --target all --unarchive --scan-project-parent D:\object --verify-app-server
+py "$env:USERPROFILE\.codex\skills\codex-history-visibility-repair\scripts\repair_codex_history_visibility.py" --target all --unarchive --verify-app-server
 ```
+
+On Windows, use `py` if `python` points to the Microsoft Store/WindowsApps placeholder.
+Only pass `--scan-project-parent D:\object` when you intentionally want every child
+directory under that parent to become a saved Codex project.
 
 ## Workflow
 
 1. Confirm the symptom with local counts: session files exist but `thread/list` or the sidebar returns too few rows.
-2. Run `--dry-run`; check `selectedThreads`, `visibleThreads`, `providerDistribution`, and `projectMappings`.
+2. Run `--dry-run`; check `selectedThreads`, `visibleThreads`, `resolvedProvider`, `resolvedSource`, `providerDistribution`, and `projectMappings`.
 3. Run without `--dry-run`; the script creates `~/.codex/history_sync_backups/visibility-repair.*`.
 4. Prefer `--verify-app-server`; success means both `threadListStateDbOnly.returned` and `threadListScanMode.returned` match visible thread count.
 5. Fully exit Codex Desktop, wait 5-10 seconds, reopen it.
+
+If scan-mode verification has to read very large rollout files, increase
+`--verify-timeout-seconds`.
 
 ## What The Script Repairs
 
@@ -45,16 +52,22 @@ python "$env:USERPROFILE\.codex\skills\codex-history-visibility-repair\scripts\r
 | rollout JSONL | syncs first `session_meta.payload` so scans do not restore stale metadata |
 | `session_index.jsonl` | rebuilds visible thread index |
 | `history.jsonl` | rebuilds prompt history entries used by desktop history surfaces |
-| `.codex-global-state.json` | rewrites project roots, root hints, and complete project assignments |
+| `.codex-global-state.json` | rewrites project roots, root hints, and complete project assignments; stale saved roots are pruned by default |
 
-Default provider is `OpenAI` because recent Codex Desktop builds filter by that exact value. Override with `--provider` only after verifying the active build expects another string.
+Provider and source default to `auto`, derived from the latest visible local thread,
+because Codex Desktop builds can filter by exact `model_provider` and `source`.
+Override with `--provider` or `--source` only after verifying the active build expects
+another string. Use `--keep-existing-project-roots` only when you want to retain
+saved roots that are not referenced by visible threads.
 
 ## Common Mistakes
 
 - Do not only copy files into `sessions/`; the sidebar also depends on SQLite and global state.
-- Do not use lowercase `openai` unless `thread/list` proves the current app expects it.
+- Do not hardcode `OpenAI`, `openai`, `cli`, or `vscode` unless `thread/list` proves the current app expects it.
 - Do not patch only `state_5.sqlite`; app-server scans rollout JSONL and can reintroduce stale provider/source metadata.
 - Do not leave old after-exit scripts running; they can overwrite the repaired global state.
+- Do not use `--scan-project-parent` as a default; it can re-add projects the user removed from the sidebar.
+- Do not use `--protect-state-minutes` unless you explicitly need a temporary write block; leaving global state read-only prevents Codex Desktop from saving sidebar changes.
 - Do not publish personal backups, databases, logs, or auth files with this skill.
 
 ## Publishing Hygiene
